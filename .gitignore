@@ -1,0 +1,33 @@
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Compiled object files
+*.o
+*.obj
+res/*.o
+
+# Debug and symbol files
+*.pdb
+*.ilk
+*.idb
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# IDE and Editor folders
+.vscode/
+.vs/
+.idea/
+
+# OS specific files
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
+# Temporary & Log files
+*.tmp
+*.log

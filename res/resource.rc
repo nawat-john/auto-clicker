@@ -1,0 +1,6 @@
+#define IDI_APP_ICON 101
+#define IDB_APP_LOGO 102
+
+1 24 "res/app.manifest"
+IDI_APP_ICON ICON "res/app_icon.ico"
+IDB_APP_LOGO BITMAP "res/app_logo.bmp"
