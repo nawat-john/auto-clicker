@@ -583,12 +583,22 @@ void AppUI::updateConfigFromUI() {
 
     m_config.mode = (SendMessageW(m_hRadioSync, BM_GETCHECK, 0, 0) == BST_CHECKED) ? ExecutionMode::SYNC : ExecutionMode::ASYNC;
 
+    HWND hFocus = GetFocus();
     wchar_t buf[64];
-    GetWindowTextW(m_hEditCpm, buf, 64);
-    try { m_config.globalCpm = std::stoul(buf); } catch (...) { m_config.globalCpm = 600; }
 
-    GetWindowTextW(m_hEditInterval, buf, 64);
-    try { m_config.globalIntervalMs = std::stoul(buf); } catch (...) { m_config.globalIntervalMs = 100; }
+    if (hFocus == m_hEditInterval) {
+        GetWindowTextW(m_hEditInterval, buf, 64);
+        try { m_config.globalIntervalMs = std::stoul(buf); } catch (...) { m_config.globalIntervalMs = 600; }
+        if (m_config.globalIntervalMs == 0) m_config.globalIntervalMs = 1;
+        m_config.updateCpmFromInterval();
+        SetWindowTextW(m_hEditCpm, std::to_wstring(m_config.globalCpm).c_str());
+    } else {
+        GetWindowTextW(m_hEditCpm, buf, 64);
+        try { m_config.globalCpm = std::stoul(buf); } catch (...) { m_config.globalCpm = 100; }
+        if (m_config.globalCpm == 0) m_config.globalCpm = 1;
+        m_config.updateIntervalFromCpm();
+        SetWindowTextW(m_hEditInterval, std::to_wstring(m_config.globalIntervalMs).c_str());
+    }
 
     GetWindowTextW(m_hEditJitter, buf, 64);
     try { m_config.randomJitterMs = std::stoul(buf); } catch (...) { m_config.randomJitterMs = 0; }

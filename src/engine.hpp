@@ -28,7 +28,7 @@ public:
     void setStatusCallback(StatusCallback callback) { m_statusCallback = callback; }
 
     static void executeAction(const ActionItem& item, uint32_t jitterMs);
-    static void preciseSleep(double milliseconds, const std::atomic<bool>& cancelFlag);
+    static void preciseSleep(double milliseconds, const std::atomic<bool>& runningFlag);
 
 private:
     void syncWorker();

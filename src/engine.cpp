@@ -28,7 +28,7 @@ AppConfig ClickerEngine::getConfig() const {
     return m_config;
 }
 
-void ClickerEngine::preciseSleep(double milliseconds, const std::atomic<bool>& cancelFlag) {
+void ClickerEngine::preciseSleep(double milliseconds, const std::atomic<bool>& runningFlag) {
     if (milliseconds <= 0.0) return;
 
     auto start = std::chrono::high_resolution_clock::now();
@@ -36,7 +36,7 @@ void ClickerEngine::preciseSleep(double milliseconds, const std::atomic<bool>& c
 
     // Coarse sleep if target > 3ms to avoid 100% CPU utilization
     if (milliseconds > 3.0) {
-        while (!cancelFlag.load(std::memory_order_relaxed)) {
+        while (runningFlag.load(std::memory_order_relaxed)) {
             auto elapsed = std::chrono::duration<double, std::micro>(
                 std::chrono::high_resolution_clock::now() - start
             ).count();
@@ -49,7 +49,7 @@ void ClickerEngine::preciseSleep(double milliseconds, const std::atomic<bool>& c
     }
 
     // Busy spin for sub-millisecond precision
-    while (!cancelFlag.load(std::memory_order_relaxed)) {
+    while (runningFlag.load(std::memory_order_relaxed)) {
         auto elapsed = std::chrono::duration<double, std::micro>(
             std::chrono::high_resolution_clock::now() - start
         ).count();
