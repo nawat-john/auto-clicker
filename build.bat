@@ -24,6 +24,7 @@ echo [2/2] Compiling C++20 Source Files...
     src/engine.cpp ^
     src/config.cpp ^
     src/hotkeys.cpp ^
+    src/keyboard_macro.cpp ^
     src/registry.cpp ^
     res/resource.o ^
     -o clicker.exe ^

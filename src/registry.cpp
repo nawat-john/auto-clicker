@@ -58,10 +58,10 @@ bool RegistryManager::saveConfig(const AppConfig& config) {
     setDword(hKey, L"HotkeyPanic", config.hotkeyPanic);
 
     std::string json = ConfigManager::serializeToJson(config);
-    setString(hKey, L"ConfigJson", json);
+    bool saved = setString(hKey, L"ConfigJson", json);
 
     RegCloseKey(hKey);
-    return true;
+    return saved;
 }
 
 bool RegistryManager::loadConfig(AppConfig& config) {

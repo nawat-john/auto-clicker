@@ -32,6 +32,7 @@ A high-performance, lightweight **Auto Clicker and Keyboard Spammer** built in *
 | **`F6`** | **Start / Stop** | Toggle the clicker engine on/off globally |
 | **`F8`** | **Pick Position** | Launch crosshair overlay to capture screen coordinates $(X, Y)$ |
 | **`F7`** | **Panic Stop** | Immediate emergency kill-switch |
+| **`F5` (hold)** | **Record Keys** | In Recorded Keys mode, record until F5 is released |
 | **`Double-Click`** | **Edit Target** | Double-click any row in the list to customize settings |
 
 ---
@@ -47,6 +48,23 @@ Simply double-click **`clicker.exe`** to launch the standalone program. No exter
 3. Set your desired **Clicks Per Minute (CPM)** or Interval.
 4. Select **Sync** or **Async** mode.
 5. Press **`F6`** to Start/Stop.
+
+### Record and replay keyboard input
+
+1. Click **+ Record Keys** (or select **Recorded Keys (hold F5)**).
+2. Focus the target application. Hold **F5**, press your keys, then release **F5**. Each nonempty recording adds a separate **Recorded Keys** action item. Repeat to add more recordings.
+3. Use the row's checkbox, **Edit Item**, **Delete**, **Up** and **Down** to enable, rename, remove or reorder recordings. Editing an item keeps its recorded keys and timing; optional Before/After delays apply around the recording.
+4. Press **F6** to play/stop. **Recorded Keys** mode plays enabled recordings in list order and skips other action types. **Sync** mixes recordings with clicks and individual key presses in list order; **Async** runs enabled items independently. **Repeat** sets the pass count (per item in Async); **0** loops until stopped. **F7** stops playback or cancels an unfinished recording.
+
+Recording preserves key-downs, key-ups, held keys, auto-repeat events, left/right modifiers, extended keys and the time between events. Keys still held when F5 is released are released at that point during replay. F5 is the recording control and F7 is reserved for emergency stop; neither is recorded. F6 and F8 can be recorded while F5 is held. F5 recording is blocked during playback.
+
+Each recorded item starts with its first key immediately, without the initial wait before that key, and preserves timing through the release of F5. CPM, interval and jitter add no delays to recorded items. Before/After delays are applied only when explicitly set in the item. Async recordings that share keys or modifiers can interfere with each other; use Sync for ordered playback. Windows scheduling and target input handling can still introduce timing variation; exact zero latency is not guaranteed. Replay sends keys to the application currently in focus and cannot bypass Windows input permission restrictions.
+
+Every item's recording is saved with the action list in the Windows Registry and included in exported JSON profiles, so recordings remain independent and profiles contain the complete data. **`recorded_keys.txt` next to `clicker.exe`** is generated automatically after recording and keeps the latest recording as a backup. It is ignored by Git; no template is needed. On upgrading a version 1 configuration, an existing recording file is imported once as an action item. Empty or cancelled recordings add no items. Recording data contains key codes and timings, so avoid sensitive input. Captures and loaded recordings are limited to one million events, with space reserved for final key releases. At the limit, recording ends safely and the UI reports it. The completed-recording queue is capped at 64 until the UI saves it. Replay validates key indices and timestamps before sending input, checks clock arithmetic, and saturates counters instead of wrapping them.
+
+The build output remains **`clicker.exe` in the project root**.
+
+Run `powershell -ExecutionPolicy Bypass -File tests/run.ps1` to test capture, file validation, multiple recording items, profile/Registry persistence, playback order, filtering, Sync/Async execution, cancellation and hidden GUI operations. Tests enable signed-overflow traps (`-ftrapv`) and container checks (`_GLIBCXX_ASSERTIONS`), cover integer/time/index limits, and intercept simulated input with an isolated Registry key, so they do not type into other applications or overwrite app settings.
 
 ---
 

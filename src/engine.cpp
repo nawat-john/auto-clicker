@@ -1,12 +1,13 @@
 #include "engine.hpp"
 #include "config.hpp"
+#include "keyboard_macro.hpp"
 #include <windows.h>
 #include <mmsystem.h>
 #include <random>
 #include <thread>
 #include <iostream>
 
-static std::mt19937 g_rng(1337);
+static thread_local std::mt19937 g_rng(1337);
 
 ClickerEngine::ClickerEngine() {
     timeBeginPeriod(1);
@@ -26,6 +27,12 @@ void ClickerEngine::setConfig(const AppConfig& config) {
 AppConfig ClickerEngine::getConfig() const {
     std::lock_guard<std::mutex> lock(m_configMutex);
     return m_config;
+}
+
+void ClickerEngine::incrementCount(std::atomic<uint64_t>& count) {
+    auto value = count.load(std::memory_order_relaxed);
+    while (value != (std::numeric_limits<uint64_t>::max)() &&
+        !count.compare_exchange_weak(value, value + 1, std::memory_order_relaxed)) {}
 }
 
 void ClickerEngine::preciseSleep(double milliseconds, const std::atomic<bool>& runningFlag) {
@@ -54,11 +61,12 @@ void ClickerEngine::preciseSleep(double milliseconds, const std::atomic<bool>& r
             std::chrono::high_resolution_clock::now() - start
         ).count();
         if (elapsed >= targetMicroseconds) break;
-        std::this_thread::yield();
+        YieldProcessor();
     }
 }
 
 void ClickerEngine::executeAction(const ActionItem& item, uint32_t jitterMs) {
+    if (item.actionType == ActionType::RECORDED_KEYS) return;
     (void)jitterMs;
     POINT originalPos = {0, 0};
     if (item.coordType == CoordType::FIXED_COORDS) {
@@ -154,15 +162,33 @@ void ClickerEngine::playSound(bool starting) {
     }).detach();
 }
 
+bool ClickerEngine::executeItem(const ActionItem& item, uint32_t jitterMs) {
+    if (item.actionType == ActionType::RECORDED_KEYS) {
+        if (!KeyboardMacro::play(item.recording, m_running)) {
+            m_inputFailed.store(true);
+            m_running.store(false);
+            if (m_statusCallback) m_statusCallback(false, m_totalCount.load());
+            return false;
+        }
+    } else {
+        executeAction(item, jitterMs);
+    }
+    if (m_running.load()) incrementCount(m_totalCount);
+    return true;
+}
+
 bool ClickerEngine::start() {
     if (m_running.load()) return false;
+    stop();
 
     // Check if there are active items
+    m_inputFailed.store(false);
     std::vector<ActionItem> activeItems;
     {
         std::lock_guard<std::mutex> lock(m_configMutex);
         for (const auto& item : m_config.items) {
-            if (item.enabled) {
+            if (item.enabled && (m_config.mode != ExecutionMode::RECORDED_KEYS ||
+                item.actionType == ActionType::RECORDED_KEYS)) {
                 activeItems.push_back(item);
             }
         }
@@ -181,12 +207,20 @@ bool ClickerEngine::start() {
 
     m_workerThreads.clear();
 
-    if (m_config.mode == ExecutionMode::SYNC) {
-        m_workerThreads.emplace_back(&ClickerEngine::syncWorker, this);
+    if (m_config.mode != ExecutionMode::ASYNC) {
+        m_activeWorkers.store(1);
+        m_workerThreads.emplace_back([this] { syncWorker(); m_activeWorkers.fetch_sub(1); });
     } else {
+        m_activeWorkers.store(activeItems.size());
         // Async: spawn a thread for each enabled item
         for (size_t i = 0; i < activeItems.size(); ++i) {
-            m_workerThreads.emplace_back(&ClickerEngine::asyncItemWorker, this, activeItems[i], i);
+            m_workerThreads.emplace_back([this, item = activeItems[i], i] {
+                asyncItemWorker(item, i);
+                if (m_activeWorkers.fetch_sub(1) == 1) {
+                    m_running.store(false);
+                    if (m_statusCallback) m_statusCallback(false, m_totalCount.load());
+                }
+            });
         }
     }
 
@@ -194,9 +228,14 @@ bool ClickerEngine::start() {
 }
 
 void ClickerEngine::stop() {
-    if (!m_running.load()) return;
+    bool wasRunning = m_running.exchange(false);
 
-    m_running.store(false);
+    // Keep keyboard hook callbacks flowing while SendInput workers release their keys.
+    while (m_activeWorkers.load() != 0) {
+        MSG message;
+        PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        Sleep(1);
+    }
 
     for (auto& t : m_workerThreads) {
         if (t.joinable()) {
@@ -204,6 +243,8 @@ void ClickerEngine::stop() {
         }
     }
     m_workerThreads.clear();
+
+    if (!wasRunning) return;
 
     playSound(false);
 
@@ -224,7 +265,8 @@ void ClickerEngine::syncWorker() {
 
         std::vector<ActionItem> enabledItems;
         for (const auto& it : cfg.items) {
-            if (it.enabled) enabledItems.push_back(it);
+            if (it.enabled && (cfg.mode != ExecutionMode::RECORDED_KEYS ||
+                it.actionType == ActionType::RECORDED_KEYS)) enabledItems.push_back(it);
         }
 
         if (enabledItems.empty()) {
@@ -242,15 +284,14 @@ void ClickerEngine::syncWorker() {
             }
 
             // Calculate Jitter
-            int jitter = 0;
-            if (cfg.randomJitterMs > 0) {
-                std::uniform_int_distribution<int> dist(-static_cast<int>(cfg.randomJitterMs), static_cast<int>(cfg.randomJitterMs));
+            int64_t jitter = 0;
+            if (cfg.randomJitterMs > 0 && item.actionType != ActionType::RECORDED_KEYS) {
+                std::uniform_int_distribution<int64_t> dist(-static_cast<int64_t>(cfg.randomJitterMs), cfg.randomJitterMs);
                 jitter = dist(g_rng);
             }
 
             // Execute
-            executeAction(item, cfg.randomJitterMs);
-            m_totalCount.fetch_add(1, std::memory_order_relaxed);
+            if (!executeItem(item, cfg.randomJitterMs)) break;
 
             // Delay after
             if (item.delayAfterMs > 0) {
@@ -259,6 +300,7 @@ void ClickerEngine::syncWorker() {
             }
 
             // Item interval wait
+            if (item.actionType == ActionType::RECORDED_KEYS) continue;
             double baseInterval = item.useCustomRate ? item.intervalMs : cfg.globalIntervalMs;
             double interval = baseInterval + jitter;
             if (interval < 1.0) interval = 1.0;
@@ -266,8 +308,7 @@ void ClickerEngine::syncWorker() {
             preciseSleep(interval, m_running);
         }
 
-        cycleCount++;
-        if (cfg.repeatCount > 0 && cycleCount >= cfg.repeatCount) {
+        if (cfg.repeatCount > 0 && ++cycleCount >= cfg.repeatCount) {
             // Reached repeat limit
             m_running.store(false);
             if (m_statusCallback) {
@@ -280,6 +321,7 @@ void ClickerEngine::syncWorker() {
 
 void ClickerEngine::asyncItemWorker(ActionItem item, size_t threadIndex) {
     (void)threadIndex;
+    uint32_t cycleCount = 0;
 
     while (m_running.load(std::memory_order_relaxed)) {
         AppConfig cfg;
@@ -295,15 +337,14 @@ void ClickerEngine::asyncItemWorker(ActionItem item, size_t threadIndex) {
         }
 
         // Calculate jitter
-        int jitter = 0;
-        if (cfg.randomJitterMs > 0) {
-            std::uniform_int_distribution<int> dist(-static_cast<int>(cfg.randomJitterMs), static_cast<int>(cfg.randomJitterMs));
+        int64_t jitter = 0;
+        if (cfg.randomJitterMs > 0 && item.actionType != ActionType::RECORDED_KEYS) {
+            std::uniform_int_distribution<int64_t> dist(-static_cast<int64_t>(cfg.randomJitterMs), cfg.randomJitterMs);
             jitter = dist(g_rng);
         }
 
         // Execute
-        executeAction(item, cfg.randomJitterMs);
-        m_totalCount.fetch_add(1, std::memory_order_relaxed);
+        if (!executeItem(item, cfg.randomJitterMs)) break;
 
         // Delay after
         if (item.delayAfterMs > 0) {
@@ -311,6 +352,8 @@ void ClickerEngine::asyncItemWorker(ActionItem item, size_t threadIndex) {
             if (!m_running.load(std::memory_order_relaxed)) break;
         }
 
+        if (cfg.repeatCount > 0 && ++cycleCount >= cfg.repeatCount) break;
+        if (item.actionType == ActionType::RECORDED_KEYS) continue;
         double baseInterval = item.useCustomRate ? item.intervalMs : cfg.globalIntervalMs;
         double interval = baseInterval + jitter;
         if (interval < 1.0) interval = 1.0;

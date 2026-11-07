@@ -1,8 +1,19 @@
 #include "config.hpp"
+#include "keyboard_macro.hpp"
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <cctype>
+#include <charconv>
+#include <stdexcept>
+
+uint32_t ConfigManager::parseUnsigned(const std::string& value) {
+    uint32_t number;
+    auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+    if (error != std::errc{} || end != value.data() + value.size())
+        throw std::out_of_range("Invalid unsigned 32-bit integer");
+    return number;
+}
 
 static std::string escapeJson(const std::string& s) {
     std::ostringstream o;
@@ -26,8 +37,9 @@ static std::string escapeJson(const std::string& s) {
 std::string ConfigManager::serializeToJson(const AppConfig& config) {
     std::ostringstream ss;
     ss << "{\n";
-    ss << "  \"version\": 1,\n";
-    ss << "  \"mode\": " << (config.mode == ExecutionMode::SYNC ? "\"sync\"" : "\"async\"") << ",\n";
+    ss << "  \"version\": 2,\n";
+    ss << "  \"mode\": \"" << (config.mode == ExecutionMode::RECORDED_KEYS ? "recorded" :
+        (config.mode == ExecutionMode::ASYNC ? "async" : "sync")) << "\",\n";
     ss << "  \"globalCpm\": " << config.globalCpm << ",\n";
     ss << "  \"globalIntervalMs\": " << config.globalIntervalMs << ",\n";
     ss << "  \"randomJitterMs\": " << config.randomJitterMs << ",\n";
@@ -50,6 +62,8 @@ std::string ConfigManager::serializeToJson(const AppConfig& config) {
         ss << "      \"restoreMouse\": " << (item.restoreMouse ? "true" : "false") << ",\n";
         ss << "      \"keyVk\": " << item.keyVk << ",\n";
         ss << "      \"keyName\": \"" << escapeJson(item.keyName) << "\",\n";
+        if (item.actionType == ActionType::RECORDED_KEYS)
+            ss << "      \"recording\": \"" << escapeJson(KeyboardMacro::serialize(item.recording)) << "\",\n";
         ss << "      \"useCustomRate\": " << (item.useCustomRate ? "true" : "false") << ",\n";
         ss << "      \"cpm\": " << item.cpm << ",\n";
         ss << "      \"intervalMs\": " << item.intervalMs << ",\n";
@@ -109,9 +123,20 @@ static std::string extractValueToken(const std::string& s, size_t& pos) {
     return token;
 }
 
+static size_t findOutsideString(const std::string& s, size_t pos, char target) {
+    bool quoted = false;
+    for (; pos < s.size(); ++pos) {
+        if (quoted && s[pos] == '\\') { ++pos; continue; }
+        if (s[pos] == '"') quoted = !quoted;
+        else if (!quoted && s[pos] == target) return pos;
+    }
+    return std::string::npos;
+}
+
 bool ConfigManager::deserializeFromJson(AppConfig& config, const std::string& json) {
     try {
         AppConfig temp = getDefaultConfig();
+        temp.version = 1;
         temp.items.clear();
 
         size_t pos = 0;
@@ -124,39 +149,42 @@ bool ConfigManager::deserializeFromJson(AppConfig& config, const std::string& js
             if (pos < json.length() && json[pos] == ':') pos++;
             skipWhitespace(json, pos);
 
-            if (key == "mode") {
+            if (key == "version") {
+                temp.version = parseUnsigned(extractValueToken(json, pos));
+            } else if (key == "mode") {
                 std::string val = extractValueToken(json, pos);
-                temp.mode = (val == "async" || val == "\"async\"") ? ExecutionMode::ASYNC : ExecutionMode::SYNC;
+                temp.mode = val == "recorded" ? ExecutionMode::RECORDED_KEYS :
+                    (val == "async" ? ExecutionMode::ASYNC : ExecutionMode::SYNC);
             } else if (key == "globalCpm") {
-                temp.globalCpm = std::stoul(extractValueToken(json, pos));
+                temp.globalCpm = parseUnsigned(extractValueToken(json, pos));
             } else if (key == "globalIntervalMs") {
-                temp.globalIntervalMs = std::stoul(extractValueToken(json, pos));
+                temp.globalIntervalMs = parseUnsigned(extractValueToken(json, pos));
             } else if (key == "randomJitterMs") {
-                temp.randomJitterMs = std::stoul(extractValueToken(json, pos));
+                temp.randomJitterMs = parseUnsigned(extractValueToken(json, pos));
             } else if (key == "repeatCount") {
-                temp.repeatCount = std::stoul(extractValueToken(json, pos));
+                temp.repeatCount = parseUnsigned(extractValueToken(json, pos));
             } else if (key == "soundFeedback") {
                 std::string val = extractValueToken(json, pos);
                 temp.soundFeedback = (val == "true");
             } else if (key == "hotkeyStartStop") {
-                temp.hotkeyStartStop = std::stoul(extractValueToken(json, pos));
+                temp.hotkeyStartStop = parseUnsigned(extractValueToken(json, pos));
             } else if (key == "hotkeyPick") {
-                temp.hotkeyPick = std::stoul(extractValueToken(json, pos));
+                temp.hotkeyPick = parseUnsigned(extractValueToken(json, pos));
             } else if (key == "hotkeyPanic") {
-                temp.hotkeyPanic = std::stoul(extractValueToken(json, pos));
+                temp.hotkeyPanic = parseUnsigned(extractValueToken(json, pos));
             } else if (key == "items") {
                 // Find array '['
                 size_t arrStart = json.find('[', pos);
                 if (arrStart != std::string::npos) {
                     pos = arrStart + 1;
                     while (pos < json.length()) {
-                        size_t objStart = json.find('{', pos);
-                        size_t arrEnd = json.find(']', pos);
+                        size_t objStart = findOutsideString(json, pos, '{');
+                        size_t arrEnd = findOutsideString(json, pos, ']');
                         if (objStart == std::string::npos || (arrEnd != std::string::npos && arrEnd < objStart)) {
                             pos = (arrEnd != std::string::npos) ? arrEnd + 1 : json.length();
                             break;
                         }
-                        size_t objEnd = json.find('}', objStart);
+                        size_t objEnd = findOutsideString(json, objStart + 1, '}');
                         if (objEnd == std::string::npos) break;
 
                         std::string itemBlock = json.substr(objStart, objEnd - objStart + 1);
@@ -174,20 +202,33 @@ bool ConfigManager::deserializeFromJson(AppConfig& config, const std::string& js
 
                             if (ikey == "id") item.id = std::stoi(ival);
                             else if (ikey == "name") item.name = ival;
-                            else if (ikey == "actionType") item.actionType = static_cast<ActionType>(std::stoi(ival));
-                            else if (ikey == "coordType") item.coordType = static_cast<CoordType>(std::stoi(ival));
+                            else if (ikey == "actionType") {
+                                auto type = parseUnsigned(ival);
+                                if (type > static_cast<uint32_t>(ActionType::RECORDED_KEYS)) return false;
+                                item.actionType = static_cast<ActionType>(type);
+                            } else if (ikey == "coordType") {
+                                auto type = parseUnsigned(ival);
+                                if (type > static_cast<uint32_t>(CoordType::FIXED_COORDS)) return false;
+                                item.coordType = static_cast<CoordType>(type);
+                            }
                             else if (ikey == "x") item.x = std::stoi(ival);
                             else if (ikey == "y") item.y = std::stoi(ival);
                             else if (ikey == "restoreMouse") item.restoreMouse = (ival == "true");
-                            else if (ikey == "keyVk") item.keyVk = static_cast<WORD>(std::stoul(ival));
+                            else if (ikey == "keyVk") {
+                                auto vk = parseUnsigned(ival);
+                                if (vk == 0 || vk >= 255) return false;
+                                item.keyVk = static_cast<WORD>(vk);
+                            }
                             else if (ikey == "keyName") item.keyName = ival;
+                            else if (ikey == "recording" && !KeyboardMacro::deserialize(item.recording, ival)) return false;
                             else if (ikey == "useCustomRate") item.useCustomRate = (ival == "true");
-                            else if (ikey == "cpm") item.cpm = std::stoul(ival);
-                            else if (ikey == "intervalMs") item.intervalMs = std::stoul(ival);
-                            else if (ikey == "delayBeforeMs") item.delayBeforeMs = std::stoul(ival);
-                            else if (ikey == "delayAfterMs") item.delayAfterMs = std::stoul(ival);
+                            else if (ikey == "cpm") item.cpm = parseUnsigned(ival);
+                            else if (ikey == "intervalMs") item.intervalMs = parseUnsigned(ival);
+                            else if (ikey == "delayBeforeMs") item.delayBeforeMs = parseUnsigned(ival);
+                            else if (ikey == "delayAfterMs") item.delayAfterMs = parseUnsigned(ival);
                             else if (ikey == "enabled") item.enabled = (ival == "true");
                         }
+                        if (item.actionType == ActionType::RECORDED_KEYS && item.recording.events.empty()) return false;
                         temp.items.push_back(item);
                         pos = objEnd + 1;
                     }
@@ -195,7 +236,9 @@ bool ConfigManager::deserializeFromJson(AppConfig& config, const std::string& js
             }
         }
 
-        if (temp.items.empty()) {
+        for (UINT vk : {temp.hotkeyStartStop, temp.hotkeyPick, temp.hotkeyPanic})
+            if (vk == 0 || vk >= 255) return false;
+        if (temp.items.empty() && temp.mode != ExecutionMode::RECORDED_KEYS) {
             temp = getDefaultConfig();
         }
         config = temp;

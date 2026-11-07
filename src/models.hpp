@@ -14,13 +14,15 @@
 #include <iomanip>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 enum class ActionType {
     MOUSE_LEFT_CLICK = 0,
     MOUSE_RIGHT_CLICK,
     MOUSE_MIDDLE_CLICK,
     MOUSE_DOUBLE_LEFT,
-    KEY_PRESS
+    KEY_PRESS,
+    RECORDED_KEYS
 };
 
 enum class CoordType {
@@ -30,7 +32,20 @@ enum class CoordType {
 
 enum class ExecutionMode {
     SYNC = 0,  // Sequential order
-    ASYNC      // Independent multi-threading per item
+    ASYNC,     // Independent multi-threading per item
+    RECORDED_KEYS
+};
+
+struct RecordedKey {
+    int64_t timeUs = 0;
+    WORD vk = 0;
+    WORD scan = 0;
+    DWORD flags = 0;
+};
+
+struct KeyRecording {
+    int64_t durationUs = 0;
+    std::vector<RecordedKey> events;
 };
 
 struct ActionItem {
@@ -43,6 +58,7 @@ struct ActionItem {
     bool restoreMouse = false;
     WORD keyVk = 'E';
     std::string keyName = "E";
+    KeyRecording recording;
     bool useCustomRate = false;
     uint32_t cpm = 600;         // Clicks Per Minute
     uint32_t intervalMs = 100;  // Interval in milliseconds
@@ -65,6 +81,7 @@ struct ActionItem {
 };
 
 struct AppConfig {
+    uint32_t version = 2;
     ExecutionMode mode = ExecutionMode::SYNC;
     uint32_t globalCpm = 600;
     uint32_t globalIntervalMs = 100;
@@ -77,6 +94,21 @@ struct AppConfig {
     UINT hotkeyPanic = VK_F7;
 
     std::vector<ActionItem> items;
+
+    int nextItemId() const {
+        std::vector<int> ids;
+        ids.reserve(items.size());
+        for (const auto& item : items) if (item.id > 0) ids.push_back(item.id);
+        std::sort(ids.begin(), ids.end());
+        int next = 1;
+        for (int id : ids) {
+            if (id < next) continue;
+            if (id > next) break;
+            if (next == (std::numeric_limits<int>::max)()) return 0;
+            ++next;
+        }
+        return next;
+    }
 
     void updateIntervalFromCpm() {
         if (globalCpm > 0) {
@@ -98,6 +130,7 @@ struct AppConfig {
             case ActionType::MOUSE_MIDDLE_CLICK: return "Middle Click";
             case ActionType::MOUSE_DOUBLE_LEFT: return "Double Click";
             case ActionType::KEY_PRESS: return "Key Press";
+            case ActionType::RECORDED_KEYS: return "Recorded Keys";
             default: return "Unknown";
         }
     }
@@ -107,6 +140,7 @@ struct AppConfig {
         if (str == "Middle Click" || str == "MOUSE_MIDDLE_CLICK") return ActionType::MOUSE_MIDDLE_CLICK;
         if (str == "Double Click" || str == "MOUSE_DOUBLE_LEFT") return ActionType::MOUSE_DOUBLE_LEFT;
         if (str == "Key Press" || str == "KEY_PRESS") return ActionType::KEY_PRESS;
+        if (str == "Recorded Keys" || str == "RECORDED_KEYS") return ActionType::RECORDED_KEYS;
         return ActionType::MOUSE_LEFT_CLICK;
     }
 

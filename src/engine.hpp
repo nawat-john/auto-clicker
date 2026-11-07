@@ -22,6 +22,7 @@ public:
     bool start();
     void stop();
     bool isRunning() const { return m_running.load(); }
+    bool inputFailed() const { return m_inputFailed.load(); }
     uint64_t getTotalCount() const { return m_totalCount.load(); }
     void resetCount() { m_totalCount.store(0); }
 
@@ -29,17 +30,21 @@ public:
 
     static void executeAction(const ActionItem& item, uint32_t jitterMs);
     static void preciseSleep(double milliseconds, const std::atomic<bool>& runningFlag);
+    static void incrementCount(std::atomic<uint64_t>& count);
 
 private:
     void syncWorker();
     void asyncItemWorker(ActionItem item, size_t threadIndex);
     void playSound(bool starting);
+    bool executeItem(const ActionItem& item, uint32_t jitterMs);
 
     AppConfig m_config;
     mutable std::mutex m_configMutex;
 
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_inputFailed{false};
     std::atomic<uint64_t> m_totalCount{0};
+    std::atomic<size_t> m_activeWorkers{0};
 
     std::vector<std::thread> m_workerThreads;
     StatusCallback m_statusCallback;

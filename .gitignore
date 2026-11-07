@@ -28,6 +28,9 @@ Thumbs.db
 [Dd]esktop.ini
 .DS_Store
 
+# Generated key recordings
+recorded_keys.txt
+
 # Temporary & Log files
 *.tmp
 *.log

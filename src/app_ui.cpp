@@ -36,6 +36,8 @@ enum ControlIds {
     ID_BTN_SAVE_PROFILE,
     ID_BTN_LOAD_PROFILE,
     ID_COMBO_PRESETS,
+    ID_RADIO_RECORDED,
+    ID_BTN_ADD_RECORDING,
     ID_TIMER_UPDATE = 3001
 };
 
@@ -83,7 +85,8 @@ AppUI::AppUI(HINSTANCE hInstance) : m_hInstance(hInstance) {
     s_instance = this;
 
     // Load from Windows Registry first, fallback to default config
-    if (!RegistryManager::loadConfig(m_config) || m_config.items.empty()) {
+    if (!RegistryManager::loadConfig(m_config) ||
+        (m_config.items.empty() && m_config.mode != ExecutionMode::RECORDED_KEYS)) {
         m_config = ConfigManager::getDefaultConfig();
         RegistryManager::saveConfig(m_config);
     }
@@ -102,6 +105,7 @@ AppUI::AppUI(HINSTANCE hInstance) : m_hInstance(hInstance) {
 
 AppUI::~AppUI() {
     m_hotkeys.unregister();
+    m_macro.disable();
     m_engine.stop();
 
     if (m_hFontMain) DeleteObject(m_hFontMain);
@@ -167,7 +171,7 @@ LRESULT CALLBACK AppUI::CustomButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             COLORREF textColor;
 
             if (btnType == 1) { // Start/Stop Toggle Button
-                bool isRunning = s_instance && s_instance->m_engine.isRunning();
+                bool isRunning = s_instance && s_instance->isRunning();
                 if (isRunning) {
                     bgColor = isPressed ? RGB(185, 28, 28) : (isHover ? RGB(220, 38, 38) : RGB(239, 68, 68)); // Red
                     borderColor = bgColor;
@@ -314,10 +318,15 @@ bool AppUI::create(int nCmdShow) {
 
     createMainControls();
     initListView();
+    bool legacyLoaded = m_macro.load(KeyboardMacro::recordingPath());
+    if (m_config.version < 2) {
+        if (legacyLoaded) addRecordedItem(m_macro.recording());
+        m_config.version = 2;
+        autoSaveToRegistry();
+    }
     updateUIFromConfig();
     updateListView();
 
-    m_hotkeys.init(m_hwndMain, m_config.hotkeyStartStop, m_config.hotkeyPanic, m_config.hotkeyPick);
     SetTimer(m_hwndMain, ID_TIMER_UPDATE, 100, nullptr);
 
     ShowWindow(m_hwndMain, nCmdShow);
@@ -363,6 +372,9 @@ void AppUI::createMainControls() {
 
     m_hRadioAsync = CreateWindowExW(0, L"BUTTON", L"Async (Independent Threads)",
         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 250, 95, 220, 22, m_hwndMain, (HMENU)ID_RADIO_ASYNC, m_hInstance, nullptr);
+
+    m_hRadioRecorded = CreateWindowExW(0, L"BUTTON", L"Recorded Keys (hold F5)",
+        WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 490, 95, 300, 22, m_hwndMain, (HMENU)ID_RADIO_RECORDED, m_hInstance, nullptr);
 
     // Rate Setting
     CreateWindowExW(0, L"STATIC", L"Global CPM:",
@@ -460,8 +472,11 @@ void AppUI::createMainControls() {
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 175, 615, 140, 34, m_hwndMain, (HMENU)ID_BTN_LOAD_PROFILE, m_hInstance, nullptr);
     SetWindowSubclass(hBtnLoad, AppUI::CustomButtonProc, 3, 3);
 
-    CreateWindowExW(0, L"STATIC", L"Auto-saved to Registry | [F6] Start/Stop | [F8] Pick Pos | [F7] Panic",
-        WS_CHILD | WS_VISIBLE | SS_RIGHT, 330, 622, 495, 24, m_hwndMain, nullptr, m_hInstance, nullptr);
+    HWND hBtnRecord = CreateWindowExW(0, L"BUTTON", L"+ Record Keys",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 325, 615, 140, 34, m_hwndMain, (HMENU)ID_BTN_ADD_RECORDING, m_hInstance, nullptr);
+    SetWindowSubclass(hBtnRecord, AppUI::CustomButtonProc, 3, 3);
+    m_hRecordHint = CreateWindowExW(0, L"STATIC", L"Hold F5: new item | F6: play | F7: stop",
+        WS_CHILD | WS_VISIBLE | SS_RIGHT, 475, 622, 350, 24, m_hwndMain, nullptr, m_hInstance, nullptr);
 
     // Apply Fonts
     EnumChildWindows(m_hwndMain, [](HWND hwnd, LPARAM lParam) -> BOOL {
@@ -535,7 +550,10 @@ void AppUI::updateListView() {
 
         // Column 2: Target / Key
         std::wstring targetStr;
-        if (item.actionType == ActionType::KEY_PRESS) {
+        if (item.actionType == ActionType::RECORDED_KEYS) {
+            targetStr = std::to_wstring(item.recording.events.size()) + L" events / " +
+                std::to_wstring(item.recording.durationUs / 1000) + L" ms";
+        } else if (item.actionType == ActionType::KEY_PRESS) {
             targetStr = L"Key: [" + utf8ToWide(item.keyName) + L"]";
         } else {
             if (item.coordType == CoordType::FOLLOW_MOUSE) {
@@ -549,7 +567,9 @@ void AppUI::updateListView() {
 
         // Column 3: Rate
         std::wstring rateStr;
-        if (item.useCustomRate) {
+        if (item.actionType == ActionType::RECORDED_KEYS) {
+            rateStr = L"Recorded timing";
+        } else if (item.useCustomRate) {
             rateStr = std::to_wstring(item.cpm) + L" CPM (" + std::to_wstring(item.intervalMs) + L"ms)";
         } else {
             rateStr = L"Global (" + std::to_wstring(m_config.globalCpm) + L" CPM)";
@@ -570,41 +590,84 @@ void AppUI::updateListView() {
 void AppUI::updateUIFromConfig() {
     SendMessageW(m_hRadioSync, BM_SETCHECK, m_config.mode == ExecutionMode::SYNC ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(m_hRadioAsync, BM_SETCHECK, m_config.mode == ExecutionMode::ASYNC ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(m_hRadioRecorded, BM_SETCHECK, m_config.mode == ExecutionMode::RECORDED_KEYS ? BST_CHECKED : BST_UNCHECKED, 0);
 
     SetWindowTextW(m_hEditCpm, std::to_wstring(m_config.globalCpm).c_str());
     SetWindowTextW(m_hEditInterval, std::to_wstring(m_config.globalIntervalMs).c_str());
     SetWindowTextW(m_hEditJitter, std::to_wstring(m_config.randomJitterMs).c_str());
     SetWindowTextW(m_hEditRepeat, std::to_wstring(m_config.repeatCount).c_str());
     SendMessageW(m_hChkSound, BM_SETCHECK, m_config.soundFeedback ? BST_CHECKED : BST_UNCHECKED, 0);
+    updateKeyboardMode();
+}
+
+void AppUI::updateKeyboardMode() {
+    bool recorded = m_config.mode == ExecutionMode::RECORDED_KEYS;
+    if (recorded != m_recordedMode) {
+        m_macro.setRecordingBlocked(true);
+        m_macro.disable();
+        m_engine.stop();
+        m_hotkeys.unregister();
+        m_recordedMode = recorded;
+    }
+    bool needsHook = recorded || std::any_of(m_config.items.begin(), m_config.items.end(),
+        [](const ActionItem& item) { return item.actionType == ActionType::RECORDED_KEYS; });
+    if (needsHook) {
+        m_hotkeys.unregister();
+        if (!m_macro.enable(m_hwndMain, m_config.hotkeyStartStop, m_config.hotkeyPanic, m_config.hotkeyPick)) {
+            SetWindowTextW(m_hRecordHint, L"Keyboard hook failed; switch mode and try again.");
+        }
+    } else {
+        m_macro.disable();
+        m_hotkeys.init(m_hwndMain, m_config.hotkeyStartStop, m_config.hotkeyPanic, m_config.hotkeyPick);
+    }
+    m_macro.setRecordingEnabled(recorded);
+    m_macro.setRecordingBlocked(m_engine.isRunning());
+    for (HWND control : {m_hEditCpm, m_hEditInterval, m_hEditJitter}) EnableWindow(control, !recorded);
+}
+
+bool AppUI::addRecordedItem(const KeyRecording& recording) {
+    if (recording.events.empty()) return false;
+    ActionItem item;
+    item.id = m_config.nextItemId();
+    if (item.id == 0) return false;
+    item.name = "Recorded Keys #" + std::to_string(item.id);
+    item.actionType = ActionType::RECORDED_KEYS;
+    item.recording = recording;
+    m_config.items.push_back(std::move(item));
+    updateListView();
+    m_engine.setConfig(m_config);
+    return RegistryManager::saveConfig(m_config);
 }
 
 void AppUI::updateConfigFromUI() {
     if (m_isUpdatingListView) return;
 
-    m_config.mode = (SendMessageW(m_hRadioSync, BM_GETCHECK, 0, 0) == BST_CHECKED) ? ExecutionMode::SYNC : ExecutionMode::ASYNC;
+    m_config.mode = SendMessageW(m_hRadioRecorded, BM_GETCHECK, 0, 0) == BST_CHECKED ? ExecutionMode::RECORDED_KEYS :
+        (SendMessageW(m_hRadioSync, BM_GETCHECK, 0, 0) == BST_CHECKED ? ExecutionMode::SYNC : ExecutionMode::ASYNC);
+    updateKeyboardMode();
 
     HWND hFocus = GetFocus();
     wchar_t buf[64];
 
     if (hFocus == m_hEditInterval) {
         GetWindowTextW(m_hEditInterval, buf, 64);
-        try { m_config.globalIntervalMs = std::stoul(buf); } catch (...) { m_config.globalIntervalMs = 600; }
+        try { m_config.globalIntervalMs = ConfigManager::parseUnsigned(wideToUtf8(buf)); } catch (...) { m_config.globalIntervalMs = 600; }
         if (m_config.globalIntervalMs == 0) m_config.globalIntervalMs = 1;
         m_config.updateCpmFromInterval();
         SetWindowTextW(m_hEditCpm, std::to_wstring(m_config.globalCpm).c_str());
     } else {
         GetWindowTextW(m_hEditCpm, buf, 64);
-        try { m_config.globalCpm = std::stoul(buf); } catch (...) { m_config.globalCpm = 100; }
+        try { m_config.globalCpm = ConfigManager::parseUnsigned(wideToUtf8(buf)); } catch (...) { m_config.globalCpm = 100; }
         if (m_config.globalCpm == 0) m_config.globalCpm = 1;
         m_config.updateIntervalFromCpm();
         SetWindowTextW(m_hEditInterval, std::to_wstring(m_config.globalIntervalMs).c_str());
     }
 
     GetWindowTextW(m_hEditJitter, buf, 64);
-    try { m_config.randomJitterMs = std::stoul(buf); } catch (...) { m_config.randomJitterMs = 0; }
+    try { m_config.randomJitterMs = ConfigManager::parseUnsigned(wideToUtf8(buf)); } catch (...) { m_config.randomJitterMs = 0; }
 
     GetWindowTextW(m_hEditRepeat, buf, 64);
-    try { m_config.repeatCount = std::stoul(buf); } catch (...) { m_config.repeatCount = 0; }
+    try { m_config.repeatCount = ConfigManager::parseUnsigned(wideToUtf8(buf)); } catch (...) { m_config.repeatCount = 0; }
 
     m_config.soundFeedback = (SendMessageW(m_hChkSound, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
@@ -622,30 +685,37 @@ void AppUI::updateConfigFromUI() {
 
 void AppUI::toggleStartStop() {
     updateConfigFromUI();
+    if (m_macro.isRecording()) return;
 
     if (m_engine.isRunning()) {
         m_engine.stop();
+        m_macro.setRecordingBlocked(false);
         SetWindowTextW(m_hStatusLabel, L"[ STOPPED ] Press F6 to Start");
         SetWindowTextW(m_hBtnStart, L"START (F6)");
         InvalidateRect(m_hBtnStart, nullptr, TRUE);
     } else {
+        m_macro.setRecordingBlocked(true);
         if (m_engine.start()) {
             SetWindowTextW(m_hStatusLabel, L"[ RUNNING ] Press F6 to Stop");
             SetWindowTextW(m_hBtnStart, L"STOP (F6)");
             InvalidateRect(m_hBtnStart, nullptr, TRUE);
         } else {
+            m_macro.setRecordingBlocked(false);
             MessageBoxW(m_hwndMain, L"Please enable at least one target action item to start!", L"Notice", MB_OK | MB_ICONINFORMATION);
         }
     }
 }
 
 void AppUI::onEmergencyStop() {
+    m_macro.cancelRecording();
+    m_macro.stop();
     if (m_engine.isRunning()) {
         m_engine.stop();
         SetWindowTextW(m_hStatusLabel, L"[ STOPPED ] Panic F7 Pressed");
         SetWindowTextW(m_hBtnStart, L"START (F6)");
         InvalidateRect(m_hBtnStart, nullptr, TRUE);
     }
+    m_macro.setRecordingBlocked(false);
 }
 
 void AppUI::startPositionPicker(std::function<void(POINT, bool)> onFinished) {
@@ -704,7 +774,8 @@ void AppUI::onPickPosition() {
             SetWindowTextW(m_hStatusLabel, msg.c_str());
         } else {
             ActionItem item;
-            item.id = static_cast<int>(m_config.items.size() + 1);
+            item.id = m_config.nextItemId();
+            if (item.id == 0) return;
             item.name = "Target (" + std::to_string(pt.x) + "," + std::to_string(pt.y) + ")";
             item.actionType = ActionType::MOUSE_LEFT_CLICK;
             item.coordType = CoordType::FIXED_COORDS;
@@ -901,7 +972,8 @@ void AppUI::openItemDialog(int itemIndex, bool defaultToKey) {
         m_tempIsNew = false;
     } else {
         m_tempItem = ActionItem();
-        m_tempItem.id = static_cast<int>(m_config.items.size() + 1);
+        m_tempItem.id = m_config.nextItemId();
+        if (m_tempItem.id == 0) return;
         m_tempItem.enabled = true;
         m_tempIsNew = true;
 
@@ -951,6 +1023,7 @@ void AppUI::openItemDialog(int itemIndex, bool defaultToKey) {
     SendMessageW(hType, CB_ADDSTRING, 0, (LPARAM)L"Mouse Middle Click");
     SendMessageW(hType, CB_ADDSTRING, 0, (LPARAM)L"Mouse Double Click");
     SendMessageW(hType, CB_ADDSTRING, 0, (LPARAM)L"Keyboard Key Press");
+    SendMessageW(hType, CB_ADDSTRING, 0, (LPARAM)L"Recorded Keys");
     SendMessageW(hType, CB_SETCURSEL, static_cast<int>(m_tempItem.actionType), 0);
 
     // Mouse Coordinates Group
@@ -1010,6 +1083,7 @@ void AppUI::openItemDialog(int itemIndex, bool defaultToKey) {
     }, (LPARAM)m_hFontMain);
     SendMessageW(hBtnSave, WM_SETFONT, (WPARAM)m_hFontBold, TRUE);
     SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)m_hFontBold, TRUE);
+    updateItemDialogControls(hDlg);
 
     SetFocus(hName);
 
@@ -1018,6 +1092,14 @@ void AppUI::openItemDialog(int itemIndex, bool defaultToKey) {
 }
 
 // Dialog Window Procedure
+void AppUI::updateItemDialogControls(HWND hwnd) {
+    bool recorded = SendMessageW(GetDlgItem(hwnd, ID_DLG_COMBO_TYPE), CB_GETCURSEL, 0, 0) ==
+        static_cast<int>(ActionType::RECORDED_KEYS);
+    for (int id : {ID_DLG_RADIO_FOLLOW, ID_DLG_RADIO_FIXED, ID_DLG_EDIT_X, ID_DLG_EDIT_Y,
+        ID_DLG_BTN_PICK, ID_DLG_CHK_RESTORE, ID_DLG_EDIT_KEY, ID_DLG_CHK_CUSTOM_RATE, ID_DLG_EDIT_CPM})
+        EnableWindow(GetDlgItem(hwnd, id), !recorded);
+}
+
 LRESULT CALLBACK AppUI::DialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (s_instance) {
         return s_instance->handleDialogMessage(hwnd, msg, wParam, lParam);
@@ -1029,6 +1111,11 @@ LRESULT AppUI::handleDialogMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     switch (msg) {
         case WM_COMMAND: {
             int id = LOWORD(wParam);
+
+            if (id == ID_DLG_COMBO_TYPE && HIWORD(wParam) == CBN_SELCHANGE) {
+                updateItemDialogControls(hwnd);
+                return 0;
+            }
 
             if (id == ID_DLG_BTN_PICK) {
                 startPositionPicker([hwnd, this](POINT pt, bool captured) {
@@ -1051,6 +1138,10 @@ LRESULT AppUI::handleDialogMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
                 int typeIdx = (int)SendMessageW(GetDlgItem(hwnd, ID_DLG_COMBO_TYPE), CB_GETCURSEL, 0, 0);
                 m_tempItem.actionType = static_cast<ActionType>(typeIdx);
+                if (m_tempItem.actionType == ActionType::RECORDED_KEYS && m_tempItem.recording.events.empty()) {
+                    MessageBoxW(hwnd, L"Use + Record Keys, then hold F5 to create a recorded item.", L"Record Keys", MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
 
                 m_tempItem.coordType = (SendMessageW(GetDlgItem(hwnd, ID_DLG_RADIO_FOLLOW), BM_GETCHECK, 0, 0) == BST_CHECKED)
                     ? CoordType::FOLLOW_MOUSE : CoordType::FIXED_COORDS;
@@ -1071,14 +1162,14 @@ LRESULT AppUI::handleDialogMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 m_tempItem.useCustomRate = (SendMessageW(GetDlgItem(hwnd, ID_DLG_CHK_CUSTOM_RATE), BM_GETCHECK, 0, 0) == BST_CHECKED);
 
                 GetDlgItemTextW(hwnd, ID_DLG_EDIT_CPM, buf, 128);
-                try { m_tempItem.cpm = std::stoul(buf); } catch (...) { m_tempItem.cpm = 600; }
+                try { m_tempItem.cpm = ConfigManager::parseUnsigned(wideToUtf8(buf)); } catch (...) { m_tempItem.cpm = 600; }
                 m_tempItem.updateIntervalFromCpm();
 
                 GetDlgItemTextW(hwnd, ID_DLG_EDIT_DELAY_BEFORE, buf, 128);
-                try { m_tempItem.delayBeforeMs = std::stoul(buf); } catch (...) { m_tempItem.delayBeforeMs = 0; }
+                try { m_tempItem.delayBeforeMs = ConfigManager::parseUnsigned(wideToUtf8(buf)); } catch (...) { m_tempItem.delayBeforeMs = 0; }
 
                 GetDlgItemTextW(hwnd, ID_DLG_EDIT_DELAY_AFTER, buf, 128);
-                try { m_tempItem.delayAfterMs = std::stoul(buf); } catch (...) { m_tempItem.delayAfterMs = 0; }
+                try { m_tempItem.delayAfterMs = ConfigManager::parseUnsigned(wideToUtf8(buf)); } catch (...) { m_tempItem.delayAfterMs = 0; }
 
                 m_tempItem.enabled = (SendMessageW(GetDlgItem(hwnd, ID_DLG_CHK_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED);
 
@@ -1147,6 +1238,21 @@ LRESULT CALLBACK AppUI::MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 LRESULT AppUI::handleMainMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case KeyboardMacro::WM_RECORDED: {
+            bool saved = true;
+            for (const auto& recording : m_macro.takeRecordings()) saved = addRecordedItem(recording) && saved;
+            m_macro.save(KeyboardMacro::recordingPath());
+            SetWindowTextW(m_hRecordHint, saved ? L"Added recorded item | F5: add another" :
+                L"Save failed; export profile to keep items.");
+            return 0;
+        }
+        case KeyboardMacro::WM_PLAYBACK_ERROR:
+            SetWindowTextW(m_hRecordHint, L"Replay blocked by Windows; check the target app's permissions.");
+            return 0;
+        case KeyboardMacro::WM_RECORDING_LIMIT:
+            SetWindowTextW(m_hRecordHint, wParam ? L"Recording queue full; release F5 and retry." :
+                L"Recording stopped at the event limit.");
+            return 0;
         case WM_HOTKEY: {
             HotkeyId id = static_cast<HotkeyId>(wParam);
             if (id == HotkeyId::START_STOP) {
@@ -1171,6 +1277,12 @@ LRESULT AppUI::handleMainMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 openItemDialog(-1, false);
             } else if (id == ID_BTN_ADD_KEY) {
                 openItemDialog(-1, true);
+            } else if (id == ID_BTN_ADD_RECORDING) {
+                onEmergencyStop();
+                m_config.mode = ExecutionMode::RECORDED_KEYS;
+                updateUIFromConfig();
+                autoSaveToRegistry();
+                SetWindowTextW(m_hRecordHint, L"Hold F5 to record a new action item.");
             } else if (id == ID_BTN_EDIT_ITEM) {
                 int sel = ListView_GetNextItem(m_hListView, -1, LVNI_SELECTED);
                 if (sel >= 0) openItemDialog(sel, false);
@@ -1187,13 +1299,13 @@ LRESULT AppUI::handleMainMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             } else if (id == ID_COMBO_PRESETS && code == CBN_SELCHANGE) {
                 int sel = (int)SendMessageW(m_hPresetCombo, CB_GETCURSEL, 0, 0);
                 loadPreset(sel);
-            } else if (id == ID_RADIO_SYNC || id == ID_RADIO_ASYNC || id == ID_CHK_SOUND) {
+            } else if (id == ID_RADIO_SYNC || id == ID_RADIO_ASYNC || id == ID_RADIO_RECORDED || id == ID_CHK_SOUND) {
                 updateConfigFromUI();
             } else if (id == ID_EDIT_CPM && code == EN_KILLFOCUS) {
                 wchar_t buf[32];
                 GetWindowTextW(m_hEditCpm, buf, 32);
                 try {
-                    uint32_t cpm = std::stoul(buf);
+                    uint32_t cpm = ConfigManager::parseUnsigned(wideToUtf8(buf));
                     if (cpm > 0) {
                         uint32_t interval = static_cast<uint32_t>((60000.0 / cpm) + 0.5);
                         if (interval == 0) interval = 1;
@@ -1205,7 +1317,7 @@ LRESULT AppUI::handleMainMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 wchar_t buf[32];
                 GetWindowTextW(m_hEditInterval, buf, 32);
                 try {
-                    uint32_t interval = std::stoul(buf);
+                    uint32_t interval = ConfigManager::parseUnsigned(wideToUtf8(buf));
                     if (interval > 0) {
                         uint32_t cpm = static_cast<uint32_t>((60000.0 / interval) + 0.5);
                         SetWindowTextW(m_hEditCpm, std::to_wstring(cpm).c_str());
@@ -1250,10 +1362,14 @@ LRESULT AppUI::handleMainMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_TIMER: {
             if (wParam == ID_TIMER_UPDATE) {
                 uint64_t count = m_engine.getTotalCount();
-                std::wstring countStr = L"Total Clicks: " + std::to_wstring(count);
+                std::wstring countStr = L"Actions: " + std::to_wstring(count);
                 SetWindowTextW(m_hCountLabel, countStr.c_str());
 
-                bool isRunning = m_engine.isRunning();
+                bool isRunning = this->isRunning();
+                m_macro.setRecordingBlocked(isRunning);
+                if (m_engine.inputFailed()) SetWindowTextW(m_hRecordHint, L"Replay failed; check target permissions.");
+                if (m_macro.isRecording()) SetWindowTextW(m_hStatusLabel, L"[ RECORDING ] Release F5");
+                else if (m_recordedMode && !isRunning) SetWindowTextW(m_hStatusLabel, L"[ READY ] Hold F5 / Replay F6");
                 wchar_t curText[64];
                 GetWindowTextW(m_hBtnStart, curText, 64);
                 if (isRunning && std::wstring(curText).find(L"START") != std::wstring::npos) {
@@ -1277,7 +1393,7 @@ LRESULT AppUI::handleMainMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             HWND hCtl = (HWND)lParam;
 
             if (hCtl == m_hStatusLabel) {
-                bool running = m_engine.isRunning();
+                bool running = isRunning() || m_macro.isRecording();
                 SetTextColor(hdc, running ? RGB(22, 163, 74) : RGB(220, 38, 38)); // Vibrant Green / Red
             } else {
                 SetTextColor(hdc, RGB(15, 23, 42)); // High contrast dark charcoal text
@@ -1296,6 +1412,9 @@ LRESULT AppUI::handleMainMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         case WM_DESTROY: {
             KillTimer(hwnd, ID_TIMER_UPDATE);
+            m_macro.disable();
+            m_hotkeys.unregister();
+            m_engine.stop();
             autoSaveToRegistry();
             PostQuitMessage(0);
             return 0;

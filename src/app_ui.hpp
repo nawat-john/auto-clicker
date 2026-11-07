@@ -3,6 +3,7 @@
 #include "models.hpp"
 #include "engine.hpp"
 #include "hotkeys.hpp"
+#include "keyboard_macro.hpp"
 #include "registry.hpp"
 #include <windows.h>
 #include <commctrl.h>
@@ -25,6 +26,7 @@ public:
     void startPositionPicker(std::function<void(POINT, bool)> onFinished);
 
 private:
+    friend struct KeyboardMacroTest;
     LRESULT handleMainMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT handleDialogMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT handlePickerMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -35,6 +37,10 @@ private:
     void updateListView();
     void updateUIFromConfig();
     void updateConfigFromUI();
+    void updateKeyboardMode();
+    bool addRecordedItem(const KeyRecording& recording);
+    void updateItemDialogControls(HWND hwnd);
+    bool isRunning() const { return m_engine.isRunning() || m_macro.isRunning(); }
     void autoSaveToRegistry();
     void toggleStartStop();
     void onEmergencyStop();
@@ -60,6 +66,8 @@ private:
     HWND m_hBtnPick = nullptr;
     HWND m_hRadioSync = nullptr;
     HWND m_hRadioAsync = nullptr;
+    HWND m_hRadioRecorded = nullptr;
+    HWND m_hRecordHint = nullptr;
     HWND m_hEditCpm = nullptr;
     HWND m_hEditInterval = nullptr;
     HWND m_hEditJitter = nullptr;
@@ -81,6 +89,8 @@ private:
     AppConfig m_config;
     ClickerEngine m_engine;
     HotkeyManager m_hotkeys;
+    KeyboardMacro m_macro;
+    bool m_recordedMode = false;
 
     // Temporary storage for item editing dialog
     ActionItem m_tempItem;
